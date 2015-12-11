@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/brookqin/BaiduPCS.svg)](https://travis-ci.org/brookqin/BaiduPCS)
+
 C/C++写的一个百度网盘工具，可以在linux终端中使用。
 这是通过分析网盘网站得到的直接接口，不需要创建应用。
 * 支持多线程下载和下载时断点续传。
