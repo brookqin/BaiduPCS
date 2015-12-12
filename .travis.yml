@@ -9,11 +9,3 @@ before_install:
 os: linux
 
 script: make clean && make
-
-deploy:
-  provider: releases
-  api_key: "$GITHUB_TOKEN"
-  file: "./bin/pcs"
-  skip_cleanup: true
-  on:
-    tags: true
