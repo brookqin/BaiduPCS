@@ -201,6 +201,82 @@ static char *pcs_get_value_by_key(const char *html, const char *key)
 	return val;
 }
 
+/*从html中解析出类似于 yunData.setData(****) 的参数。*/
+static char *pcs_get_yunData(const char *html, const char *key)
+{
+#define ST_LEN 32
+	char *val = NULL, st[ST_LEN];
+	const char *p = html,
+		*end = NULL,
+		*tmp;
+	int i = strlen(key),
+		si = 0;
+
+	st[0] = '\0';
+#define st_push(c) st[++si] = (c)
+#define st_pop() st[si--]
+#define st_top() st[si]
+
+	while (*p) {
+		if (*p == key[0] && pcs_utils_streq(p, key, i)) {
+			tmp = p + i;
+			PCS_SKIP_SPACE(tmp);
+			if (*tmp != '=') {
+				p++; continue;
+			}tmp++;
+			PCS_SKIP_SPACE(tmp);
+			if (*tmp != '{') {
+				p++; continue;
+			}
+			end = tmp;
+
+			while (*end) {
+				if (st_top() == '\\') {
+					st_pop();
+				}
+				else {
+					switch (*end) {
+					case '"':
+						if (st_top() == '"') {
+							st_pop();
+						}
+						else {
+							st_push('"');
+						}
+						break;
+					case '\\':
+						st_push('\\');
+						break;
+					case '{':
+					case '[':
+					case '(':
+						if (st_top() != '"')
+							st_push(*end);
+						break;
+					case '}':
+					case ']':
+					case ')':
+						if (st_top() != '"')
+							st_pop();
+						break;
+					}
+				}
+				if (si == 0)
+					break;
+				end++;
+			}
+			if (*end == '}') {
+				val = (char *)pcs_malloc(end - tmp + 2);
+				memcpy(val, tmp, end - tmp + 1);
+				val[end - tmp + 1] = '\0';
+				return val;
+			}
+		}
+		p++;
+	}
+	return val;
+}
+
 /*从URL地址的QueryString中解析出类似于 &error=123&a= 的值。此例中，key传入"&error"，将返回123*/
 static char *pcs_get_embed_query_int_value_by_key(const char *html, const char *key)
 {
@@ -824,7 +900,7 @@ static int pcs_get_errno_from_api_res(Pcs handle, const char *html)
 	return res;
 }
 
-static PcsFileInfo *pcs_upload_form(Pcs handle, const char *path, PcsHttpForm form, const char *ondup)
+static PcsFileInfo *pcs_upload_form(Pcs handle, const char *path, PcsHttpForm form, curl_off_t max_speed, const char *ondup)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	char *url, *html,
@@ -847,7 +923,7 @@ static PcsFileInfo *pcs_upload_form(Pcs handle, const char *path, PcsHttpForm fo
 		pcs_set_errmsg(handle, "Can't build the url.");
 		return NULL;
 	}
-	html = pcs_post_httpform(pcs->http, url, form, PcsTrue);
+	html = pcs_post_httpform(pcs->http, url, form, max_speed, PcsTrue);
 	pcs_free(url);
 	if (!html) {
 		const char *errmsg = pcs_http_strerror(pcs->http);
@@ -884,7 +960,7 @@ static PcsFileInfo *pcs_upload_form(Pcs handle, const char *path, PcsHttpForm fo
 	return meta;
 }
 
-static PcsFileInfo *pcs_upload_slice_form(Pcs handle, PcsHttpForm form)
+static PcsFileInfo *pcs_upload_slice_form(Pcs handle, PcsHttpForm form, curl_off_t max_speed)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	char *url, *html;
@@ -901,7 +977,7 @@ static PcsFileInfo *pcs_upload_slice_form(Pcs handle, PcsHttpForm form)
 		pcs_set_errmsg(handle, "Can't build the url.");
 		return NULL;
 	}
-	html = pcs_post_httpform(pcs->http, url, form, PcsTrue);
+	html = pcs_post_httpform(pcs->http, url, form, max_speed, PcsTrue);
 	pcs_free(url);
 	if (!html) {
 		const char *errmsg = pcs_http_strerror(pcs->http);
@@ -1246,7 +1322,7 @@ PCS_API PcsRes pcs_islogin(Pcs handle)
 	int http_code;
 
 	pcs_clear_errmsg(handle);
-	html = pcs_http_get(pcs->http, URL_DISK_HOME, PcsFalse);
+	html = pcs_http_get(pcs->http, URL_DISK_HOME, PcsTrue);
 	http_code = pcs_http_code(pcs->http);
 	if (http_code != 200) {
 		if (http_code != 302) {
@@ -1272,6 +1348,36 @@ PCS_API PcsRes pcs_islogin(Pcs handle)
 	pcs->bdstoken = pcs_get_value_by_key(html, "yunData.MYBDSTOKEN");
 	if (!pcs->bdstoken || strlen(pcs->bdstoken) == 0) {
 		pcs->bdstoken = pcs_get_value_by_key(html, "FileUtils.bdstoken");
+	}
+	if (!pcs->bdstoken || strlen(pcs->bdstoken) == 0) {
+		cJSON *json, *item;
+		char *jsonData = pcs_get_yunData(html, "context");
+		//char *jsonData = pcs_get_yunData(html, "yunData.setData");
+		if (!jsonData) {
+			return PCS_NOT_LOGIN;
+		}
+		json = cJSON_Parse(jsonData);
+		if (!json) {
+			pcs_free(jsonData);
+			return PCS_NOT_LOGIN;
+		}
+		item = cJSON_GetObjectItem(json, "bdstoken");
+		if (!item || !item->valuestring || strlen(item->valuestring) == 0) {
+			pcs_free(jsonData);
+			cJSON_Delete(json);
+			return PCS_NOT_LOGIN;
+		}
+		pcs->bdstoken = pcs_utils_strdup(item->valuestring);
+		if (pcs->bduss) pcs_free(pcs->bduss);
+		pcs->bduss = pcs_http_get_cookie(pcs->http, "BDUSS");
+		if (pcs->sysUID) pcs_free(pcs->sysUID);
+		item = cJSON_GetObjectItem(json, "username");
+		if (item && item->valuestring) {
+			pcs->sysUID = pcs_utils_strdup(item->valuestring);
+		}
+		pcs_free(jsonData);
+		cJSON_Delete(json);
+		return PCS_LOGIN;
 	}
 	if (pcs->bdstoken != NULL && strlen(pcs->bdstoken) > 0) {
 		//printf("bdstoken: %s\n", pcs->bdstoken);
@@ -1991,7 +2097,7 @@ PCS_API const char *pcs_cat(Pcs handle, const char *path, size_t *dstsz)
 	return pcs->buffer;
 }
 
-PCS_API PcsFileInfo *pcs_upload_buffer(Pcs handle, const char *path, PcsBool overwrite, const char *buffer, size_t buffer_size)
+PCS_API PcsFileInfo *pcs_upload_buffer(Pcs handle, const char *path, PcsBool overwrite, const char *buffer, size_t buffer_size, curl_off_t max_speed)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	char *filename;
@@ -2009,13 +2115,13 @@ PCS_API PcsFileInfo *pcs_upload_buffer(Pcs handle, const char *path, PcsBool ove
 		return NULL;
 	}
 	pcs_free(filename);
-	meta = pcs_upload_form(handle, path, form, overwrite ? "overwrite" : "newcopy");
+	meta = pcs_upload_form(handle, path, form, max_speed, overwrite ? "overwrite" : "newcopy");
 	pcs_http_form_destroy(pcs->http, form);
 	if (buf != buffer) pcs_free(buf);
 	return meta;
 }
 
-PCS_API PcsFileInfo *pcs_upload_slice(Pcs handle, const char *buffer, size_t buffer_size)
+PCS_API PcsFileInfo *pcs_upload_slice(Pcs handle, const char *buffer, size_t buffer_size, curl_off_t max_speed)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	PcsHttpForm form = NULL;
@@ -2029,7 +2135,7 @@ PCS_API PcsFileInfo *pcs_upload_slice(Pcs handle, const char *buffer, size_t buf
 		if (buf != buffer) pcs_free(buf);
 		return NULL;
 	}
-	meta = pcs_upload_slice_form(handle, form);
+	meta = pcs_upload_slice_form(handle, form, max_speed);
 	pcs_http_form_destroy(pcs->http, form);
 	if (buf != buffer) pcs_free(buf);
 	return meta;
@@ -2038,7 +2144,7 @@ PCS_API PcsFileInfo *pcs_upload_slice(Pcs handle, const char *buffer, size_t buf
 PCS_API PcsFileInfo *pcs_upload_slicefile(Pcs handle, 
 	size_t(*read_func)(void *ptr, size_t size, size_t nmemb, void *userdata),
 	void *userdata,
-	size_t content_size)
+	size_t content_size, curl_off_t max_speed)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	PcsHttpForm form = NULL;
@@ -2049,7 +2155,7 @@ PCS_API PcsFileInfo *pcs_upload_slicefile(Pcs handle,
 		pcs_set_errmsg(handle, "Can't build the post data.");
 		return NULL;
 	}
-	meta = pcs_upload_slice_form(handle, form);
+	meta = pcs_upload_slice_form(handle, form, max_speed);
 	pcs_http_form_destroy(pcs->http, form);
 	return meta;
 }
@@ -2143,7 +2249,7 @@ PCS_API PcsFileInfo *pcs_create_superfile(Pcs handle, const char *path, PcsBool 
 }
 
 PCS_API PcsFileInfo *pcs_upload(Pcs handle, const char *path, PcsBool overwrite, 
-									   const char *local_filename)
+									   const char *local_filename, curl_off_t max_speed)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	char *filename;
@@ -2158,7 +2264,7 @@ PCS_API PcsFileInfo *pcs_upload(Pcs handle, const char *path, PcsBool overwrite,
 		return NULL;
 	}
 	pcs_free(filename);
-	meta = pcs_upload_form(handle, path, form, overwrite ? "overwrite" : "newcopy");
+	meta = pcs_upload_form(handle, path, form, max_speed, overwrite ? "overwrite" : "newcopy");
 	pcs_http_form_destroy(pcs->http, form);
 	return meta;
 }
@@ -2166,7 +2272,7 @@ PCS_API PcsFileInfo *pcs_upload(Pcs handle, const char *path, PcsBool overwrite,
 PCS_API PcsFileInfo *pcs_upload_s(Pcs handle, const char *to_path, PcsBool overwrite,
 	size_t(*read_func)(void *ptr, size_t size, size_t nmemb, void *userdata),
 	void *userdata,
-	size_t content_size)
+	size_t content_size, curl_off_t max_speed)
 {
 	struct pcs *pcs = (struct pcs *)handle;
 	char *filename;
@@ -2179,7 +2285,7 @@ PCS_API PcsFileInfo *pcs_upload_s(Pcs handle, const char *to_path, PcsBool overw
 		pcs_set_errmsg(handle, "Can't build the post data.");
 		return NULL;
 	}
-	meta = pcs_upload_form(handle, to_path, form, overwrite ? "overwrite" : "newcopy");
+	meta = pcs_upload_form(handle, to_path, form, max_speed, overwrite ? "overwrite" : "newcopy");
 	pcs_http_form_destroy(pcs->http, form);
 	return meta;
 }
